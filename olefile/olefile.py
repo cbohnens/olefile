@@ -280,6 +280,27 @@ import io
 import sys
 import struct, array, os.path, datetime, logging
 
+# bintrees for its RBTree implementation
+import bintrees
+from operator import attrgetter
+from collections import deque
+
+# debugging stuff
+from binascii import hexlify
+def hexler(inp):
+    hexed = hexlify(inp).decode()
+    for i, c in enumerate(hexed):
+        if i % 0x40 == 0:
+            print("{:05d}: ".format(i//2), end="")
+        if i % 0x40 == 0x40-1:
+            end="\n"
+        elif i % 8 == 7:
+            end=" "
+        else:
+            end=""
+        print(c, end=end)
+
+
 #=== COMPATIBILITY WORKAROUNDS ================================================
 
 #[PL] Define explicitly the public API to avoid private objects in pydoc:
@@ -573,6 +594,52 @@ def filetime2datetime(filetime):
 
 #=== CLASSES ==================================================================
 
+class TransparentNode(bintrees.rbtree.Node):
+    
+    def __str__(self):
+        return str(self.key.name)
+    
+
+class TransparentRBTree(bintrees.RBTree):
+    """subclassed only to provide a transparent iterator that exposes the internal
+    tree structure by returning the node objects in breath-first order top-down"""
+
+    def _new_node(self, key, value):
+        """Create a new tree node."""
+        self._count += 1
+        return TransparentNode(key, value)
+        
+    def iter_tree(self, left=attrgetter("left"), right=attrgetter("right"), start_key=None, end_key=None):
+        if self._root is None:
+            return []
+        q = deque()
+        q.append(self._root)
+        in_range = self._get_in_range_func(start_key, end_key)
+
+        while len(q):
+            node = q.popleft()
+            if in_range(node.key):
+                yield node
+            if left(node) is not None:
+                q.append(left(node))
+            if right(node) is not None:
+                q.append(right(node))
+                
+    def dump_tree(self, left=attrgetter("left"), right=attrgetter("right")):
+        if self._root is None:
+            return []
+        q = deque()
+        q.append((self._root, "root"))
+
+        while len(q):
+            node, desc = q.popleft()
+            yield "{}: {}, {}".format(desc, node.key.name, node.red)
+            if left(node) is not None:
+                q.append((left(node), "left"))
+            if right(node) is not None:
+                q.append((right(node), "right"))
+
+                    
 class OleMetadata:
     """
     class to parse and store metadata from standard properties of OLE files.
@@ -919,11 +986,11 @@ class OleDirectoryEntry:
         self.olefile = olefile
         # kids is a list of children entries, if this entry is a storage:
         # (list of OleDirectoryEntry objects)
-        self.kids = []
+        #self.kids = [] # removed to make conversion to internal tree storage explicit
         # kids_dict is a dictionary of children entries, indexed by their
         # name in lowercase: used to quickly find an entry, and to detect
         # duplicates
-        self.kids_dict = {}
+        self.kids_dict = TransparentRBTree()
         # flag used to detect if the entry is referenced more than once in
         # directory:
         self.used = False
@@ -1001,7 +1068,17 @@ class OleDirectoryEntry:
             olefile._check_duplicate_stream(self.isectStart, minifat)
 
 
-
+    def __repr__(self):
+        """ this is more a __str__, but I am lazy...."""
+        outl = []
+        outl.append('DirEntry SID=%d: %s' % (self.sid, repr(self.name)))
+        outl.append(' - type: %d' % self.entry_type)
+        outl.append(' - sect: %Xh, len %d' % (self.isectStart, self.size))
+        outl.append(' - SID left: %d, right: %d, child: %d' % (self.sid_left,
+            self.sid_right, self.sid_child))
+        outl.append("")
+        return "\n".join(outl)
+        
     def build_storage_tree(self):
         """
         Read and build the red-black tree attached to this OleDirectoryEntry
@@ -1023,8 +1100,91 @@ class OleDirectoryEntry:
             # in the OLE file, entries are sorted on (length, name).
             # for convenience, we sort them on name instead:
             # (see rich comparison methods in this class)
-            self.kids.sort()
+            #self.kids.sort() # removed because list view no longer exists. Needed?
 
+    def update_rbtree_sids(self, start_sid):
+        """rewrite all the sid infos along the tree. automatically recurses into subtrees"""
+        # todo: should be possible to do this in one pass when writing out to disk
+        sid = start_sid
+        for node in self.kids_dict.iter_tree():
+            node.key.sid = sid
+            log.debug("setting sid={node.key.sid} for name={node.key.name}({node.key.entry_type})".format(node=node))
+            sid += 1
+            if node.key.entry_type == STGTY_STORAGE:
+                # iterate through child aswell
+                sid = node.key.update_rbtree_sids(sid)
+        return sid
+        
+    def dump_tree(self, entries=[]):
+        """recurse through own tree and all children, return list of entries"""
+        for node in self.kids_dict.keys():
+            entries.append(node)
+            if node.entry_type == STGTY_STORAGE:
+                # iterate through child aswell
+                node.dump_tree(entries)
+        return entries
+
+    def _asbytes_helper(self, node=None, child_sid=None):
+        """dump dir entry as on-disk format"""
+        if node.key is not None:
+            assert node.key.name == self.name
+        name_raw = (self.name + "\x00").encode("utf-16-le")
+        namelen = len(name_raw)
+        if node.red:
+            black = 1
+        else:
+            black = 0
+        if node.left is not None:
+            left = node.left.key.sid
+        else:
+            left = NOSTREAM
+        if node.right is not None:
+            right = node.right.key.sid
+        else:
+            right = NOSTREAM
+        if child_sid is not None:
+            child = child_sid
+        else:
+            child = NOSTREAM
+        #log.debug("name={}, sid={}, entry {}: left={}, right={}, child={}, black={}".format(self.name, self.sid, repr(name_raw), left, right, child, black))
+        return struct.pack(self.STRUCT_DIRENTRY,
+            name_raw,
+            namelen,
+            self.entry_type,
+            black,
+            left,
+            right,
+            child,
+            b'\x00'*16,
+            self.dwUserFlags,
+            self.createTime,
+            self.modifyTime,
+            self.isectStart,
+            self.size & 0xFFFFFFFF,
+            self.size>>32)
+        
+    def asbytes(self, own_root=None):
+        """return self and all child dirs as bytes object, ready to be written to file or buffer"""
+        # walk through tree from the top, pulling out SIDs from the child nodes as needed
+        dir_list = []
+        if own_root is None:
+            root_node = TransparentNode(key=self, value=None)
+        else:
+            root_node = own_root
+        # insert root node
+        dir_list.append((root_node, self.kids_dict._root.key.sid))
+        #buf.extend(self._asbytes_helper(dummy_node, self.rb_tree._root.key.sid))
+        # insert children
+        for node in self.kids_dict.iter_tree():
+            if node.key.entry_type == STGTY_STORAGE:
+                # recurse through child
+                dir_list.extend(node.key.asbytes(node))
+                #buf.extend(node.key.asbytes())
+            else:
+                dir_list.append((node, None))
+                #buf.extend(node.key._asbytes_helper(node, None))
+        #return buf
+        return dir_list
 
     def append_kids(self, child_sid):
         """
@@ -1046,6 +1206,8 @@ class OleDirectoryEntry:
         else:
             # get child direntry:
             child = self.olefile._load_direntry(child_sid) #direntries[child_sid]
+            # keep reference for later
+            self.child = child
             log.debug('append_kids: child_sid=%d - %s - sid_left=%d, sid_right=%d, sid_child=%d'
                 % (child.sid, repr(child.name), child.sid_left, child.sid_right, child.sid_child))
             # the directory entries are organized as a red-black tree.
@@ -1053,14 +1215,13 @@ class OleDirectoryEntry:
             # First walk through left side of the tree:
             self.append_kids(child.sid_left)
             # Check if its name is not already used (case-insensitive):
-            name_lower = child.name.lower()
-            if name_lower in self.kids_dict:
+            # the rich comparisons should take care of this...
+            if child in self.kids_dict:
                 self.olefile._raise_defect(DEFECT_INCORRECT,
                     "Duplicate filename in OLE storage")
             # Then the child_sid OleDirectoryEntry object is appended to the
-            # kids list and dictionary:
-            self.kids.append(child)
-            self.kids_dict[name_lower] = child
+            # kids dictionary:
+            self.kids_dict[child] = None # everything is stored in the key itself, but RBTree needs a value...
             # Check if kid was not already referenced in a storage:
             if child.used:
                 self.olefile._raise_defect(DEFECT_INCORRECT,
@@ -1074,11 +1235,15 @@ class OleDirectoryEntry:
 
     def __eq__(self, other):
         "Compare entries by name"
-        return self.name == other.name
+        return self.name.upper() == other.name.upper()
 
     def __lt__(self, other):
         "Compare entries by name"
-        return self.name < other.name
+        if len(self.name) < len(other.name):
+            return True
+        elif len(self.name) > len(other.name):
+            return False
+        return self.name.upper() < other.name.upper()
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -1088,8 +1253,9 @@ class OleDirectoryEntry:
 
     # Reflected __lt__() and __le__() will be used for __gt__() and __ge__()
 
-    #TODO: replace by the same function as MS implementation ?
-    # (order by name length first, then case-insensitive order)
+    # TODO: replace by the same function as MS implementation ?
+    # for now, just compare length, and use python upper on unicode string. 
+    # should be close enough to the MS version in reality...
 
 
     def dump(self, tab = 0):
@@ -1135,6 +1301,108 @@ class OleDirectoryEntry:
         return filetime2datetime(self.createTime)
 
 
+class FatWrapper:
+
+    def __str__(self):
+        if self.minifat:
+            return "fat: " + repr(self.fat)
+        else:
+            return "difats: " + repr(self.difats) + "\nfat: " + repr(self.fat)
+
+    def __init__(self, blocksize=512, initial_difat_size=109*4, minifat=False):
+        self.blocksize = blocksize
+        self.initial_difat_size = initial_difat_size
+        self.minifat = minifat
+        self.content = io.BytesIO()
+        if not minifat:
+            # start with first difat in header
+            assert initial_difat_size % 4 == 0
+            # always assume the first block is for the start of the FAT itself
+            self.difats = [array.array(UINT32, [0])]
+            # start with one fat containing only itself
+            self.fat = array.array(UINT32, [FATSECT])
+        else:
+            self.fat = array.array(UINT32)
+        self.next_free = len(self.fat)
+        
+    def _write_sect(self, sect, data):
+        log.debug("writing at sect {}: len(data)={} {}".format(sect, len(data), data))
+        assert len(data) <= self.blocksize
+        assert sect < len(self.fat)
+        seeked = self.content.seek(sect*self.blocksize)
+        self.content.write(data)
+        if len(data) < self.blocksize:
+            # pad with 0es
+            self.content.write(b"\x00" * (self.blocksize-len(data)))
+        
+    def allocate_entry(self, data, prev_sect=None):
+        """allocate sectors from fat and fill with data. return the starting sector"""
+        assert len(data) > 0
+        # paranoia check?
+        assert len(self.fat) == self.next_free
+        first_sect = self.next_free
+        sects_needed = (len(data)+self.blocksize-1)//self.blocksize
+        for sect in iterrange(sects_needed):
+            if not self.minifat:
+                # check if we have to create a new FAT
+                if len(self.fat) % self.blocksize == 0:
+                    # allocate new fat from difat, initialize
+                    # todo: allocate new difat if difat full
+                    if len(self.difats[0]) > self.initial_difat_size:
+                        raise NotImplementedError("DIFAT cannot grow yet, file too large!")
+                    self.difats[-1].append(self.next_free)
+                    self.fat.append(FATSECT)
+                    self.next_free += 1
+            # add entry to fat
+            self.fat.append(ENDOFCHAIN)
+            # copy over contents
+            self._write_sect(self.next_free, data[sect*self.blocksize:(sect+1)*self.blocksize])
+            # check if we have to set prev sect
+            if prev_sect is not None:
+                self.fat[prev_sect] = self.next_free
+            # save current sect for overwriting next round
+            prev_sect = self.next_free
+            self.next_free += 1
+        return first_sect, sects_needed
+        
+    def fat_asbytes(self):
+        return self.fat.tobytes()
+        
+    def as_buffer(self):
+        """fill in current fat contents in buffer, then return copy suitable for writing to file"""
+        if not self.minifat:
+            # fill fat sectors with content
+            assert len(self.difats) == 1 # TODO: implement multiple difats
+            fat_copy = self.fat[:]
+            entries_per_fat = self.blocksize//4
+            for fat_entry in self.difats[0]:
+                sect = fat_copy[:entries_per_fat]
+                fat_copy = fat_copy[entries_per_fat:]
+                assert len(sect) > 0
+                if len(sect) < entries_per_fat:
+                    sect.extend([FREESECT for i in range(entries_per_fat-len(sect))])
+                self._write_sect(fat_entry, sect.tobytes())
+        # return content buffer
+        return self.content.getbuffer()
+
+    def update_entry(self, start_sect, data):
+        """update an already allocated entry. 
+        If the length of content needs additional blocks, they will be allocated - 
+        but no freeing of unused blocks will happen (yet)."""
+        sect_list = [start_sect]
+        while self.fat[sect_list[-1]] != ENDOFCHAIN:
+            sect_list.append(self.fat[sect_list[-1]])
+        sects_needed = (len(data)+self.blocksize-1)//self.blocksize
+        if sects_needed < len(sect_list):
+            log.warning("freeing of unused sectors not yet supported. zeropadding the remains...")
+        for i, s in enumerate(sect_list):
+            self._write_sect(s, data[i*self.blocksize:(i+1)*self.blocksize])
+        if sects_needed > len(sect_list):
+            self.allocate_entry(sects_needed-len(sect_list), data[(i+1)*self.blocksize:], sect_list[-1])
+        return start_sect
+
+        
+        
 #--- OleFileIO ----------------------------------------------------------------
 
 class OleFileIO:
@@ -1165,6 +1433,45 @@ class OleFileIO:
     Library to view the resulting files (which happens to be standard
     TIFF files).
     """
+    # [PL] header structure according to AAF specifications:
+    ##Header
+    ##struct StructuredStorageHeader { // [offset from start (bytes), length (bytes)]
+    ##BYTE _abSig[8]; // [00H,08] {0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1,
+    ##                // 0x1a, 0xe1} for current version
+    ##CLSID _clsid;   // [08H,16] reserved must be zero (WriteClassStg/
+    ##                // GetClassFile uses root directory class id)
+    ##USHORT _uMinorVersion; // [18H,02] minor version of the format: 33 is
+    ##                       // written by reference implementation
+    ##USHORT _uDllVersion;   // [1AH,02] major version of the dll/format: 3 for
+    ##                       // 512-byte sectors, 4 for 4 KB sectors
+    ##USHORT _uByteOrder;    // [1CH,02] 0xFFFE: indicates Intel byte-ordering
+    ##USHORT _uSectorShift;  // [1EH,02] size of sectors in power-of-two;
+    ##                       // typically 9 indicating 512-byte sectors
+    ##USHORT _uMiniSectorShift; // [20H,02] size of mini-sectors in power-of-two;
+    ##                          // typically 6 indicating 64-byte mini-sectors
+    ##USHORT _usReserved; // [22H,02] reserved, must be zero
+    ##ULONG _ulReserved1; // [24H,04] reserved, must be zero
+    ##FSINDEX _csectDir; // [28H,04] must be zero for 512-byte sectors,
+    ##                   // number of SECTs in directory chain for 4 KB
+    ##                   // sectors
+    ##FSINDEX _csectFat; // [2CH,04] number of SECTs in the FAT chain
+    ##SECT _sectDirStart; // [30H,04] first SECT in the directory chain
+    ##DFSIGNATURE _signature; // [34H,04] signature used for transactions; must
+    ##                        // be zero. The reference implementation
+    ##                        // does not support transactions
+    ##ULONG _ulMiniSectorCutoff; // [38H,04] maximum size for a mini stream;
+    ##                           // typically 4096 bytes
+    ##SECT _sectMiniFatStart; // [3CH,04] first SECT in the MiniFAT chain
+    ##FSINDEX _csectMiniFat; // [40H,04] number of SECTs in the MiniFAT chain
+    ##SECT _sectDifStart; // [44H,04] first SECT in the DIFAT chain
+    ##FSINDEX _csectDif; // [48H,04] number of SECTs in the DIFAT chain
+    ##SECT _sectFat[109]; // [4CH,436] the SECTs of first 109 FAT sectors
+    ##};
+    # [PL] header decoding:
+    # '<' indicates little-endian byte ordering for Intel (cf. struct module help)
+    FMT_HEADER = '<8s16sHHHHHHLLLLLLLLLL'
+    
+    
 
     def __init__(self, filename=None, raise_defects=DEFECT_FATAL,
                  write_mode=False, debug=False, path_encoding=DEFAULT_PATH_ENCODING):
@@ -1252,6 +1559,112 @@ class OleFileIO:
             return unicode_str
 
 
+    def write_to_file(self, filename):
+        """Experimental rewrite of a complete new OLE2 file.
+        TODO: be able to handle full header DIFAT (size > 6.8MB)
+        planned steps (not necessarily in order):
+         - calculate directory size
+         - allocate directory space
+         - allocate space for all streams, (calculate ministream size)
+         - allocate minifat from main fat
+         - allocate ministream from main fat
+         - create dir tree
+         - fill in header information
+         - copy stream contents
+         - write file to disk
+        """
+        # update directory metadata, get list of entries (for stream allocation)
+        assert self.root.name == 'Root Entry'
+        assert self.root.sid == 0
+        self.root.update_rbtree_sids(self.root.sid + 1)
+        dir_entries = self.root.dump_tree()
+        
+        # create main fat
+        fresh_fat = FatWrapper(blocksize=self.sector_size)
+
+        # create minifat
+        fresh_minifat = FatWrapper(blocksize=self.mini_sector_size, minifat=True)
+        
+        # allocate an initial block for the directory, altium expects the dir starting at a fixed offset...
+        #initial_dir_sect = fresh_fat.allocate_entry(1, b'')
+
+        # allocate space for all the streams, either from fat or minifat
+        for dir in dir_entries:
+            if dir.entry_type == STGTY_STREAM:
+                # extract buffer interface to current data contents
+                data_io = dir.olefile._open(start=dir.isectStart, size=dir.size, force_FAT=False)
+                data_io.seek(0)
+                data = data_io.read()
+                if dir.size >= self.mini_stream_cutoff_size:
+                    # "any stream larger than or equal...."
+                    dir.isectStart, secs_needed = fresh_fat.allocate_entry(data)
+                    log.debug("allocated %d bytes (%d secs) from main fat at 0x%X for stream %s" % (dir.size, secs_needed, dir.isectStart, dir.sid))
+                else:
+                    dir.isectStart, secs_needed = fresh_minifat.allocate_entry(data)
+                    log.debug("allocated %d bytes (%d secs) from minifat at 0x%X for stream %s" % (dir.size, secs_needed, dir.isectStart, dir.sid))
+            else:
+                pass # anything to do here?
+
+        # allocate minifat from main fat
+        minifat_isect, minifat_sectors_needed = fresh_fat.allocate_entry(fresh_minifat.fat_asbytes())
+        log.debug("allocated %d sectors from fat at 0x%X for minifat (len %d)" % (minifat_sectors_needed, minifat_isect, len(fresh_minifat.fat)))
+
+        # allocate ministream from main fat
+        ministream_size = len(fresh_minifat.fat)*fresh_minifat.blocksize
+        ministream_isect, ministream_sectors_needed = fresh_fat.allocate_entry(fresh_minifat.as_buffer())
+        log.debug("allocated %d sectors from fat at 0x%X for ministream (%d bytes)" % (ministream_sectors_needed, ministream_isect, ministream_size))
+
+        # store ministream info in root dir entry
+        self.root.isectStart = ministream_isect
+        self.root.size = ministream_size
+
+
+        # allocate directory from main fat (needs to happen _after_ minifat allocation, otherwise root entry info is stale!)
+        #initial_dir_sect = fresh_fat.allocate_entry(1, b'')
+        dir_list = self.root.asbytes()
+        dir_list.sort(key=lambda x: x[0].key.sid)
+        buf = bytearray()
+        for node, child_sid in dir_list:
+            buf.extend(node.key._asbytes_helper(node, child_sid))
+        dir_isect, dir_sectors_needed = fresh_fat.allocate_entry(buf)
+        log.debug("allocated %d sectors from fat at 0x%X for %d directory entries" % (dir_sectors_needed, dir_isect, len(dir_entries)))
+
+        self.dumpfat(fresh_fat.fat)
+        self.dumpfat(fresh_minifat.fat)
+        
+        # dump everything to disk
+        with open(filename, "wb") as outfile:
+            # header
+            outfile.write(struct.pack(self.FMT_HEADER,
+                bytes([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+                bytes(16),
+                62, # 33 is reference impl?
+                3,
+                0xFFFE,
+                9,
+                6,
+                0,
+                0,
+                0,
+                len(fresh_fat.difats[0]),
+                dir_isect,
+                0,
+                4096,
+                minifat_isect,
+                minifat_sectors_needed,
+                0xFFFFFFFE, # difat NYI
+                0))
+            # difat (remaining space in header)
+            temp_difat = array.array(UINT32, [FREESECT for i in range(109)])
+            for i, v in enumerate(fresh_fat.difats[0]):
+                temp_difat[i] = v
+            outfile.write(bytes(temp_difat))
+            # write out main fat (including contents)
+            outfile.write(fresh_fat.as_buffer())
+                                        
+
+                
+        
     def open(self, filename, write_mode=False):
         """
         Open an OLE2 file in read-only or read/write mode.
@@ -1315,45 +1728,7 @@ class OleFileIO:
             log.debug('Magic = %r instead of %r' % (header[:8], MAGIC))
             self._raise_defect(DEFECT_FATAL, "not an OLE2 structured storage file")
 
-        # [PL] header structure according to AAF specifications:
-        ##Header
-        ##struct StructuredStorageHeader { // [offset from start (bytes), length (bytes)]
-        ##BYTE _abSig[8]; // [00H,08] {0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1,
-        ##                // 0x1a, 0xe1} for current version
-        ##CLSID _clsid;   // [08H,16] reserved must be zero (WriteClassStg/
-        ##                // GetClassFile uses root directory class id)
-        ##USHORT _uMinorVersion; // [18H,02] minor version of the format: 33 is
-        ##                       // written by reference implementation
-        ##USHORT _uDllVersion;   // [1AH,02] major version of the dll/format: 3 for
-        ##                       // 512-byte sectors, 4 for 4 KB sectors
-        ##USHORT _uByteOrder;    // [1CH,02] 0xFFFE: indicates Intel byte-ordering
-        ##USHORT _uSectorShift;  // [1EH,02] size of sectors in power-of-two;
-        ##                       // typically 9 indicating 512-byte sectors
-        ##USHORT _uMiniSectorShift; // [20H,02] size of mini-sectors in power-of-two;
-        ##                          // typically 6 indicating 64-byte mini-sectors
-        ##USHORT _usReserved; // [22H,02] reserved, must be zero
-        ##ULONG _ulReserved1; // [24H,04] reserved, must be zero
-        ##FSINDEX _csectDir; // [28H,04] must be zero for 512-byte sectors,
-        ##                   // number of SECTs in directory chain for 4 KB
-        ##                   // sectors
-        ##FSINDEX _csectFat; // [2CH,04] number of SECTs in the FAT chain
-        ##SECT _sectDirStart; // [30H,04] first SECT in the directory chain
-        ##DFSIGNATURE _signature; // [34H,04] signature used for transactions; must
-        ##                        // be zero. The reference implementation
-        ##                        // does not support transactions
-        ##ULONG _ulMiniSectorCutoff; // [38H,04] maximum size for a mini stream;
-        ##                           // typically 4096 bytes
-        ##SECT _sectMiniFatStart; // [3CH,04] first SECT in the MiniFAT chain
-        ##FSINDEX _csectMiniFat; // [40H,04] number of SECTs in the MiniFAT chain
-        ##SECT _sectDifStart; // [44H,04] first SECT in the DIFAT chain
-        ##FSINDEX _csectDif; // [48H,04] number of SECTs in the DIFAT chain
-        ##SECT _sectFat[109]; // [4CH,436] the SECTs of first 109 FAT sectors
-        ##};
-
-        # [PL] header decoding:
-        # '<' indicates little-endian byte ordering for Intel (cf. struct module help)
-        fmt_header = '<8s16sHHHHHHLLLLLLLLLL'
-        header_size = struct.calcsize(fmt_header)
+        header_size = struct.calcsize(self.FMT_HEADER)
         log.debug( "fmt_header size = %d, +FAT = %d" % (header_size, header_size + 109*4) )
         header1 = header[:header_size]
         (
@@ -1375,8 +1750,8 @@ class OleFileIO:
             self.num_mini_fat_sectors,
             self.first_difat_sector,
             self.num_difat_sectors
-        ) = struct.unpack(fmt_header, header1)
-        log.debug( struct.unpack(fmt_header,    header1))
+        ) = struct.unpack(self.FMT_HEADER, header1)
+        log.debug( struct.unpack(self.FMT_HEADER, header1) )
 
         if self.header_signature != MAGIC:
             # OLE signature should always be present
@@ -1923,7 +2298,7 @@ class OleFileIO:
             (note: the root storage is never included)
         """
         prefix = prefix + [node.name]
-        for entry in node.kids:
+        for entry in node.kids_dict.keys():
             if entry.entry_type == STGTY_STORAGE:
                 # this is a storage
                 if storages:
@@ -1977,13 +2352,13 @@ class OleFileIO:
         # walk across storage tree, following given path:
         node = self.root
         for name in filename:
-            for kid in node.kids:
+            for kid in node.kids_dict.keys():
                 if kid.name.lower() == name.lower():
                     break
             else:
                 raise IOError("file not found")
             node = kid
-        return node.sid
+        return node
 
 
     def openstream(self, filename):
@@ -2001,8 +2376,7 @@ class OleFileIO:
         :returns: file object (read-only)
         :exception IOError: if filename not found, or if this is not a stream.
         """
-        sid = self._find(filename)
-        entry = self.direntries[sid]
+        entry = self._find(filename)
         if entry.entry_type != STGTY_STREAM:
             raise IOError("this file is not a stream")
         return self._open(entry.isectStart, entry.size)
@@ -2025,8 +2399,7 @@ class OleFileIO:
         """
         if not isinstance(data, bytes):
             raise TypeError("write_stream: data must be a bytes string")
-        sid = self._find(stream_name)
-        entry = self.direntries[sid]
+        entry = self._find(stream_name)
         if entry.entry_type != STGTY_STREAM:
             raise IOError("this is not a stream")
         size = entry.size
@@ -2082,8 +2455,7 @@ class OleFileIO:
             - STGTY_ROOT: the root entry
         """
         try:
-            sid = self._find(filename)
-            entry = self.direntries[sid]
+            entry = self._find(filename)
             return entry.entry_type
         except:
             return False
@@ -2099,8 +2471,7 @@ class OleFileIO:
 
         new in version 0.44
         """
-        sid = self._find(filename)
-        entry = self.direntries[sid]
+        entry = self._find(filename)
         return entry.clsid
 
 
@@ -2115,8 +2486,7 @@ class OleFileIO:
 
         new in version 0.26
         """
-        sid = self._find(filename)
-        entry = self.direntries[sid]
+        entry = self._find(filename)
         return entry.getmtime()
 
 
@@ -2131,8 +2501,7 @@ class OleFileIO:
 
         new in version 0.26
         """
-        sid = self._find(filename)
-        entry = self.direntries[sid]
+        entry = self._find(filename)
         return entry.getctime()
 
 
@@ -2146,7 +2515,7 @@ class OleFileIO:
         :returns: True if object exist, else False.
         """
         try:
-            sid = self._find(filename)
+            entry = self._find(filename)
             return True
         except:
             return False
@@ -2161,8 +2530,7 @@ class OleFileIO:
         :exception IOError: if file not found
         :exception TypeError: if this is not a stream.
         """
-        sid = self._find(filename)
-        entry = self.direntries[sid]
+        entry = self._find(filename)
         if entry.entry_type != STGTY_STREAM:
             #TODO: Should it return zero instead of raising an exception ?
             raise TypeError('object is not an OLE stream')
