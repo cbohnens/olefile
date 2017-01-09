@@ -272,6 +272,8 @@ __author__  = "Philippe Lagadec"
 #------------------------------------------------------------------------------
 
 __all__ = ['isOleFile', 'OleFileIO', 'OleMetadata', 'enable_logging',
+           'OleDirectoryEntry',
+           'TransparentRBTree',
            'MAGIC', 'STGTY_EMPTY',
            'STGTY_STREAM', 'STGTY_STORAGE', 'STGTY_ROOT', 'STGTY_PROPERTY',
            'STGTY_LOCKBYTES', 'MINIMAL_OLEFILE_SIZE',]
@@ -972,9 +974,21 @@ class OleDirectoryEntry:
     assert struct.calcsize(STRUCT_DIRENTRY) == DIRENTRY_SIZE
 
 
-    def __init__(self, entry, sid, olefile):
+    def __init__(self, entry, sid=None, olefile=None, bare=False):
         """
         Constructor for an OleDirectoryEntry object.
+
+        """
+        if bare:
+            # entry is a dict with all needed info
+            self.__dict__.update(entry)
+
+        else:
+            self._parse_direntry(entry, sid, olefile)
+
+
+    def _parse_direntry(self, entry, sid, olefile):
+        """
         Parses a 128-bytes entry from the OLE Directory stream.
 
         :param entry  : string (must be 128 bytes long)
@@ -1180,6 +1194,12 @@ class OleDirectoryEntry:
                 #buf.extend(node.key._asbytes_helper(node, None))
         #return buf
         return dir_list
+
+    def add_child(self, child):
+        """add a child to the internal kids tree"""
+        assert self.entry_type in (STGTY_STORAGE, STGTY_ROOT)
+        log.debug("adding to {}: {}".format(self, child))
+        self.kids_dict[child] = None
 
     def append_kids(self, child_sid):
         """
@@ -1554,7 +1574,7 @@ class OleFileIO:
             return unicode_str
 
 
-    def write_to_file(self, filename):
+    def write_to_file(self, filename, root_node=None):
         """Experimental rewrite of a complete new OLE2 file.
         TODO: be able to handle full header DIFAT (size > 6.8MB)
         planned steps (not necessarily in order):
@@ -1568,12 +1588,14 @@ class OleFileIO:
          - copy stream contents
          - write file to disk
         """
+        if root_node is None:
+            root_node = self.root
         # update directory metadata, get list of entries (for stream allocation)
-        assert self.root.name == 'Root Entry'
-        assert self.root.sid == 0
-        self.root.update_rbtree_sids(self.root.sid + 1)
-        dir_entries = self.root.dump_tree()
-        
+        assert root_node.name == 'Root Entry'
+        assert root_node.sid == 0
+        root_node.update_rbtree_sids(root_node.sid + 1)
+        dir_entries = root_node.dump_tree()
+
         # create main fat
         fresh_fat = FatWrapper(blocksize=self.sector_size)
 
@@ -1586,10 +1608,14 @@ class OleFileIO:
         # allocate space for all the streams, either from fat or minifat
         for dir in dir_entries:
             if dir.entry_type == STGTY_STREAM:
-                # extract buffer interface to current data contents
-                data_io = dir.olefile._open(start=dir.isectStart, size=dir.size, force_FAT=False)
-                data_io.seek(0)
-                data = data_io.read()
+                # extract data contents
+                if dir.isectStart is not None:
+                    data_io = dir.olefile._open(start=dir.isectStart, size=dir.size, force_FAT=False)
+                    data_io.seek(0)
+                    data = data_io.read()
+                else:
+                    data = dir.content
+                    dir.size = len(data)
                 if dir.size >= self.mini_stream_cutoff_size:
                     # "any stream larger than or equal...."
                     dir.isectStart, secs_needed = fresh_fat.allocate_entry(data)
@@ -1610,13 +1636,13 @@ class OleFileIO:
         log.debug("allocated %d sectors from fat at 0x%X for ministream (%d bytes)" % (ministream_sectors_needed, ministream_isect, ministream_size))
 
         # store ministream info in root dir entry
-        self.root.isectStart = ministream_isect
-        self.root.size = ministream_size
+        root_node.isectStart = ministream_isect
+        root_node.size = ministream_size
 
 
         # allocate directory from main fat (needs to happen _after_ minifat allocation, otherwise root entry info is stale!)
         #initial_dir_sect = fresh_fat.allocate_entry(1, b'')
-        dir_list = self.root.asbytes()
+        dir_list = root_node.asbytes()
         dir_list.sort(key=lambda x: x[0].key.sid)
         buf = bytearray()
         for node, child_sid in dir_list:
