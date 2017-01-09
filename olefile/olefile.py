@@ -595,10 +595,10 @@ def filetime2datetime(filetime):
 #=== CLASSES ==================================================================
 
 class TransparentNode(bintrees.rbtree.Node):
-    
+
     def __str__(self):
         return str(self.key.name)
-    
+
 
 class TransparentRBTree(bintrees.RBTree):
     """subclassed only to provide a transparent iterator that exposes the internal
@@ -608,7 +608,7 @@ class TransparentRBTree(bintrees.RBTree):
         """Create a new tree node."""
         self._count += 1
         return TransparentNode(key, value)
-        
+
     def iter_tree(self, left=attrgetter("left"), right=attrgetter("right"), start_key=None, end_key=None):
         if self._root is None:
             return []
@@ -624,7 +624,7 @@ class TransparentRBTree(bintrees.RBTree):
                 q.append(left(node))
             if right(node) is not None:
                 q.append(right(node))
-                
+
     def dump_tree(self, left=attrgetter("left"), right=attrgetter("right")):
         if self._root is None:
             return []
@@ -639,7 +639,7 @@ class TransparentRBTree(bintrees.RBTree):
             if right(node) is not None:
                 q.append((right(node), "right"))
 
-                    
+
 class OleMetadata:
     """
     class to parse and store metadata from standard properties of OLE files.
@@ -1070,15 +1070,8 @@ class OleDirectoryEntry:
 
     def __repr__(self):
         """ this is more a __str__, but I am lazy...."""
-        outl = []
-        outl.append('DirEntry SID=%d: %s' % (self.sid, repr(self.name)))
-        outl.append(' - type: %d' % self.entry_type)
-        outl.append(' - sect: %Xh, len %d' % (self.isectStart, self.size))
-        outl.append(' - SID left: %d, right: %d, child: %d' % (self.sid_left,
-            self.sid_right, self.sid_child))
-        outl.append("")
-        return "\n".join(outl)
-        
+        return 'DirEntry SID=%s: %s' % (str(self.sid), repr(self.name))
+
     def build_storage_tree(self):
         """
         Read and build the red-black tree attached to this OleDirectoryEntry
@@ -1114,9 +1107,11 @@ class OleDirectoryEntry:
                 # iterate through child aswell
                 sid = node.key.update_rbtree_sids(sid)
         return sid
-        
-    def dump_tree(self, entries=[]):
+
+    def dump_tree(self, entries=None):
         """recurse through own tree and all children, return list of entries"""
+        if entries is None:
+            entries = []
         for node in self.kids_dict.keys():
             entries.append(node)
             if node.entry_type == STGTY_STORAGE:
@@ -1162,7 +1157,7 @@ class OleDirectoryEntry:
             self.isectStart,
             self.size & 0xFFFFFFFF,
             self.size>>32)
-        
+
     def asbytes(self, own_root=None):
         """return self and all child dirs as bytes object, ready to be written to file or buffer"""
         # walk through tree from the top, pulling out SIDs from the child nodes as needed
@@ -1189,7 +1184,7 @@ class OleDirectoryEntry:
     def append_kids(self, child_sid):
         """
         Walk through red-black tree of children of this directory entry to add
-        all of them to the kids list. (recursive method)
+        all of them to the kids dict. (recursive method)
 
         :param child_sid: index of child directory entry to use, or None when called
             first time for the root. (only used during recursion)
@@ -1254,7 +1249,7 @@ class OleDirectoryEntry:
     # Reflected __lt__() and __le__() will be used for __gt__() and __ge__()
 
     # TODO: replace by the same function as MS implementation ?
-    # for now, just compare length, and use python upper on unicode string. 
+    # for now, just compare length, and use python upper on unicode string.
     # should be close enough to the MS version in reality...
 
 
@@ -1324,7 +1319,7 @@ class FatWrapper:
         else:
             self.fat = array.array(UINT32)
         self.next_free = len(self.fat)
-        
+
     def _write_sect(self, sect, data):
         log.debug("writing at sect {}: len(data)={} {}".format(sect, len(data), data))
         assert len(data) <= self.blocksize
@@ -1334,7 +1329,7 @@ class FatWrapper:
         if len(data) < self.blocksize:
             # pad with 0es
             self.content.write(b"\x00" * (self.blocksize-len(data)))
-        
+
     def allocate_entry(self, data, prev_sect=None):
         """allocate sectors from fat and fill with data. return the starting sector"""
         assert len(data) > 0
@@ -1364,10 +1359,10 @@ class FatWrapper:
             prev_sect = self.next_free
             self.next_free += 1
         return first_sect, sects_needed
-        
+
     def fat_asbytes(self):
         return self.fat.tobytes()
-        
+
     def as_buffer(self):
         """fill in current fat contents in buffer, then return copy suitable for writing to file"""
         if not self.minifat:
@@ -1386,8 +1381,8 @@ class FatWrapper:
         return self.content.getbuffer()
 
     def update_entry(self, start_sect, data):
-        """update an already allocated entry. 
-        If the length of content needs additional blocks, they will be allocated - 
+        """update an already allocated entry.
+        If the length of content needs additional blocks, they will be allocated -
         but no freeing of unused blocks will happen (yet)."""
         sect_list = [start_sect]
         while self.fat[sect_list[-1]] != ENDOFCHAIN:
@@ -1401,8 +1396,8 @@ class FatWrapper:
             self.allocate_entry(sects_needed-len(sect_list), data[(i+1)*self.blocksize:], sect_list[-1])
         return start_sect
 
-        
-        
+
+
 #--- OleFileIO ----------------------------------------------------------------
 
 class OleFileIO:
@@ -1470,8 +1465,8 @@ class OleFileIO:
     # [PL] header decoding:
     # '<' indicates little-endian byte ordering for Intel (cf. struct module help)
     FMT_HEADER = '<8s16sHHHHHHLLLLLLLLLL'
-    
-    
+
+
 
     def __init__(self, filename=None, raise_defects=DEFECT_FATAL,
                  write_mode=False, debug=False, path_encoding=DEFAULT_PATH_ENCODING):
@@ -1584,7 +1579,7 @@ class OleFileIO:
 
         # create minifat
         fresh_minifat = FatWrapper(blocksize=self.mini_sector_size, minifat=True)
-        
+
         # allocate an initial block for the directory, altium expects the dir starting at a fixed offset...
         #initial_dir_sect = fresh_fat.allocate_entry(1, b'')
 
@@ -1631,7 +1626,7 @@ class OleFileIO:
 
         self.dumpfat(fresh_fat.fat)
         self.dumpfat(fresh_minifat.fat)
-        
+
         # dump everything to disk
         with open(filename, "wb") as outfile:
             # header
@@ -1661,10 +1656,10 @@ class OleFileIO:
             outfile.write(bytes(temp_difat))
             # write out main fat (including contents)
             outfile.write(fresh_fat.as_buffer())
-                                        
 
-                
-        
+
+
+
     def open(self, filename, write_mode=False):
         """
         Open an OLE2 file in read-only or read/write mode.
