@@ -1341,7 +1341,7 @@ class FatWrapper:
         self.next_free = len(self.fat)
 
     def _write_sect(self, sect, data):
-        log.debug("writing at sect {}: len(data)={} {}".format(sect, len(data), data))
+        log.debug("writing at sect {}: len(data)={} {}".format(sect, len(data), data[:15]))
         assert len(data) <= self.blocksize
         assert sect < len(self.fat)
         seeked = self.content.seek(sect*self.blocksize)
@@ -1650,8 +1650,9 @@ class OleFileIO:
         dir_isect, dir_sectors_needed = fresh_fat.allocate_entry(buf)
         log.debug("allocated %d sectors from fat at 0x%X for %d directory entries" % (dir_sectors_needed, dir_isect, len(dir_entries)))
 
-        self.dumpfat(fresh_fat.fat)
-        self.dumpfat(fresh_minifat.fat)
+        if log.isEnabledFor(logging.DEBUG):
+            self.dumpfat(fresh_fat.fat)
+            self.dumpfat(fresh_minifat.fat)
 
         # dump everything to disk
         with open(filename, "wb") as outfile:
