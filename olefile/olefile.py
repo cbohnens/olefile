@@ -1326,6 +1326,7 @@ class FatWrapper:
 
     def __init__(self, blocksize=512, initial_difat_size=109*4, minifat=False):
         self.blocksize = blocksize
+        self.entries_per_fat = self.blocksize//4
         self.initial_difat_size = initial_difat_size
         self.minifat = minifat
         self.content = io.BytesIO()
@@ -1355,19 +1356,23 @@ class FatWrapper:
         assert len(data) > 0
         # paranoia check?
         assert len(self.fat) == self.next_free
-        first_sect = self.next_free
+        first_sect = None
         sects_needed = (len(data)+self.blocksize-1)//self.blocksize
         for sect in iterrange(sects_needed):
             if not self.minifat:
                 # check if we have to create a new FAT
-                if len(self.fat) % self.blocksize == 0:
+                if len(self.fat) % self.entries_per_fat == 0:
                     # allocate new fat from difat, initialize
                     # todo: allocate new difat if difat full
                     if len(self.difats[0]) > self.initial_difat_size:
                         raise NotImplementedError("DIFAT cannot grow yet, file too large!")
                     self.difats[-1].append(self.next_free)
                     self.fat.append(FATSECT)
+                    log.debug("allocating fat at {}".format(self.next_free))
                     self.next_free += 1
+            # save first sector
+            if first_sect is None:
+                first_sect = self.next_free
             # add entry to fat
             self.fat.append(ENDOFCHAIN)
             # copy over contents
@@ -1389,13 +1394,12 @@ class FatWrapper:
             # fill fat sectors with content
             assert len(self.difats) == 1 # TODO: implement multiple difats
             fat_copy = self.fat[:]
-            entries_per_fat = self.blocksize//4
             for fat_entry in self.difats[0]:
-                sect = fat_copy[:entries_per_fat]
-                fat_copy = fat_copy[entries_per_fat:]
+                sect = fat_copy[:self.entries_per_fat]
+                fat_copy = fat_copy[self.entries_per_fat:]
                 assert len(sect) > 0
-                if len(sect) < entries_per_fat:
-                    sect.extend([FREESECT for i in range(entries_per_fat-len(sect))])
+                if len(sect) < self.entries_per_fat:
+                    sect.extend([FREESECT for i in range(self.entries_per_fat-len(sect))])
                 self._write_sect(fat_entry, sect.tobytes())
         # return content buffer
         return self.content.getbuffer()
@@ -1486,7 +1490,7 @@ class OleFileIO:
     # '<' indicates little-endian byte ordering for Intel (cf. struct module help)
     FMT_HEADER = '<8s16sHHHHHHLLLLLLLLLL'
 
-
+    DEFAULTS = dict(sector_size=512, mini_sector_size=64, mini_stream_cutoff_size=0x1000)
 
     def __init__(self, filename=None, raise_defects=DEFECT_FATAL,
                  write_mode=False, debug=False, path_encoding=DEFAULT_PATH_ENCODING):
@@ -1527,6 +1531,8 @@ class OleFileIO:
         self.fp = None
         if filename:
             self.open(filename, write_mode=write_mode)
+        else:
+            self.__dict__.update(self.DEFAULTS)
 
 
     def _raise_defect(self, defect_level, message, exception_type=IOError):
